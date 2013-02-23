@@ -1,5 +1,6 @@
 /*
  * Copyright (C) 2012 The Android Open Source Project
+ * Copyright (c) 2012 The CyanogenMod Project
  *
  * Licensed under the Apache License, Version 2.0 (the "License");
  * you may not use this file except in compliance with the License.
@@ -25,15 +26,13 @@
 #include <hardware/hardware.h>
 #include <hardware/power.h>
 
-#define SCALINGMAXFREQ_PATH "/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq"
-#define SCREENOFFMAXFREQ_PATH "/sys/devices/system/cpu/cpu0/cpufreq/screen_off_max_freq"
-#define BOOSTPULSE_PATH "/sys/devices/system/cpu/cpufreq/interactive/boostpulse"
-
-#define MAX_BUF_SZ  10
-
-/* initialize to something safe */
-static char screen_off_max_freq[MAX_BUF_SZ] = "700000";
-static char scaling_max_freq[MAX_BUF_SZ] = "1200000";
+#define SCALING_GOVERNOR_PATH "/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor"
+#define BOOSTPULSE_ONDEMAND "/sys/devices/system/cpu/cpufreq/ondemand/boostpulse"
+#define BOOSTPULSE_INTERACTIVE "/sys/devices/system/cpu/cpufreq/interactive/boostpulse"
+#define SAMPLING_RATE_SCREEN_ON "50000"
+#define SAMPLING_RATE_SCREEN_OFF "500000"
+#define TIMER_RATE_SCREEN_ON "30000"
+#define TIMER_RATE_SCREEN_OFF "500000"
 
 struct tuna_power_module {
     struct power_module base;
@@ -41,6 +40,36 @@ struct tuna_power_module {
     int boostpulse_fd;
     int boostpulse_warned;
 };
+
+static char governor[20];
+
+static int sysfs_read(char *path, char *s, int num_bytes)
+{
+    char buf[80];
+    int count;
+    int ret = 0;
+    int fd = open(path, O_RDONLY);
+
+    if (fd < 0) {
+        strerror_r(errno, buf, sizeof(buf));
+        ALOGE("Error opening %s: %s\n", path, buf);
+
+        return -1;
+    }
+
+    if ((count = read(fd, s, num_bytes - 1)) < 0) {
+        strerror_r(errno, buf, sizeof(buf));
+        ALOGE("Error writing to %s: %s\n", path, buf);
+
+        ret = -1;
+    } else {
+        s[count] = '\0';
+    }
+
+    close(fd);
+
+    return ret;
+}
 
 static void sysfs_write(char *path, char *s)
 {
@@ -63,40 +92,49 @@ static void sysfs_write(char *path, char *s)
     close(fd);
 }
 
-int sysfs_read(const char *path, char *buf, size_t size)
-{
-  int fd, len;
+static int get_scaling_governor() {
+    if (sysfs_read(SCALING_GOVERNOR_PATH, governor,
+                sizeof(governor)) == -1) {
+        return -1;
+    } else {
+        // Strip newline at the end.
+        int len = strlen(governor);
 
-  fd = open(path, O_RDONLY);
-  if (fd < 0)
-    return -1;
+        len--;
 
-  do {
-    len = read(fd, buf, size);
-  } while (len < 0 && errno == EINTR);
+        while (len >= 0 && (governor[len] == '\n' || governor[len] == '\r'))
+            governor[len--] = '\0';
+    }
 
-  close(fd);
-
-  return len;
+    return 0;
 }
 
-static void tuna_power_init(struct power_module *module)
+static void tuna_power_set_interactive(struct power_module *module, int on)
 {
-    /*
-     * cpufreq interactive governor: timer 20ms, min sample 60ms,
-     * hispeed 700MHz at load 50%.
-     */
+    if (strncmp(governor, "ondemand", 8) == 0)
+        sysfs_write("/sys/devices/system/cpu/cpufreq/ondemand/sampling_rate",
+                on ? SAMPLING_RATE_SCREEN_ON : SAMPLING_RATE_SCREEN_OFF);
+    else if (strncmp(governor, "interactive", 11) == 0)
+        sysfs_write("/sys/devices/system/cpu/cpufreq/interactive/timer_rate",
+                on ? TIMER_RATE_SCREEN_ON : TIMER_RATE_SCREEN_OFF);
+}
 
-    sysfs_write("/sys/devices/system/cpu/cpufreq/interactive/timer_rate",
-                "20000");
-    sysfs_write("/sys/devices/system/cpu/cpufreq/interactive/min_sample_time",
-                "60000");
-    sysfs_write("/sys/devices/system/cpu/cpufreq/interactive/hispeed_freq",
-                "700000");
-    sysfs_write("/sys/devices/system/cpu/cpufreq/interactive/go_hispeed_load",
-                "50");
-    sysfs_write("/sys/devices/system/cpu/cpufreq/interactive/above_hispeed_delay",
-                "100000");
+
+static void configure_governor()
+{
+    tuna_power_set_interactive(NULL, 1);
+
+    if (strncmp(governor, "ondemand", 8) == 0) {
+        sysfs_write("/sys/devices/system/cpu/cpufreq/ondemand/up_threshold", "90");
+        sysfs_write("/sys/devices/system/cpu/cpufreq/ondemand/io_is_busy", "1");
+        sysfs_write("/sys/devices/system/cpu/cpufreq/ondemand/sampling_down_factor", "4");
+        sysfs_write("/sys/devices/system/cpu/cpufreq/ondemand/down_differential", "10");
+
+    } else if (strncmp(governor, "interactive", 11) == 0) {
+        sysfs_write("/sys/devices/system/cpu/cpufreq/interactive/min_sample_time", "90000");
+        sysfs_write("/sys/devices/system/cpu/cpufreq/interactive/hispeed_freq", "1134000");
+        sysfs_write("/sys/devices/system/cpu/cpufreq/interactive/above_hispeed_delay", "30000");
+    }
 }
 
 static int boostpulse_open(struct tuna_power_module *tuna)
@@ -106,13 +144,22 @@ static int boostpulse_open(struct tuna_power_module *tuna)
     pthread_mutex_lock(&tuna->lock);
 
     if (tuna->boostpulse_fd < 0) {
-        tuna->boostpulse_fd = open(BOOSTPULSE_PATH, O_WRONLY);
+        if (get_scaling_governor() < 0) {
+            ALOGE("Can't read scaling governor.");
+            tuna->boostpulse_warned = 1;
+        } else {
+            if (strncmp(governor, "ondemand", 8) == 0)
+                tuna->boostpulse_fd = open(BOOSTPULSE_ONDEMAND, O_WRONLY);
+            else if (strncmp(governor, "interactive", 11) == 0)
+                tuna->boostpulse_fd = open(BOOSTPULSE_INTERACTIVE, O_WRONLY);
 
-        if (tuna->boostpulse_fd < 0) {
-            if (!tuna->boostpulse_warned) {
+            if (tuna->boostpulse_fd < 0 && !tuna->boostpulse_warned) {
                 strerror_r(errno, buf, sizeof(buf));
-                ALOGE("Error opening %s: %s\n", BOOSTPULSE_PATH, buf);
+                ALOGV("Error opening boostpulse: %s\n", buf);
                 tuna->boostpulse_warned = 1;
+            } else if (tuna->boostpulse_fd > 0) {
+                configure_governor();
+                ALOGD("Opened %s boostpulse interface", governor);
             }
         }
     }
@@ -121,37 +168,35 @@ static int boostpulse_open(struct tuna_power_module *tuna)
     return tuna->boostpulse_fd;
 }
 
-static void tuna_power_set_interactive(struct power_module *module, int on)
-{
-    int len;
-
-    char buf[MAX_BUF_SZ];
-
-    /*
-     * Lower maximum frequency when screen is off.  CPU 0 and 1 share a
-     * cpufreq policy.
-     */
-
-    sysfs_write(SCREENOFFMAXFREQ_PATH,screen_off_max_freq);
-}
-
 static void tuna_power_hint(struct power_module *module, power_hint_t hint,
                             void *data)
 {
     struct tuna_power_module *tuna = (struct tuna_power_module *) module;
     char buf[80];
     int len;
+    int duration = 1;
 
     switch (hint) {
     case POWER_HINT_INTERACTION:
+    case POWER_HINT_CPU_BOOST:
         if (boostpulse_open(tuna) >= 0) {
-	    len = write(tuna->boostpulse_fd, "1", 1);
+            if (data != NULL)
+                duration = (int) data;
 
-	    if (len < 0) {
-	        strerror_r(errno, buf, sizeof(buf));
-		ALOGE("Error writing to %s: %s\n", BOOSTPULSE_PATH, buf);
-	    }
-	}
+            snprintf(buf, sizeof(buf), "%d", duration);
+            len = write(tuna->boostpulse_fd, buf, strlen(buf));
+
+            if (len < 0) {
+                strerror_r(errno, buf, sizeof(buf));
+	            ALOGE("Error writing to boostpulse: %s\n", buf);
+
+                pthread_mutex_lock(&tuna->lock);
+                close(tuna->boostpulse_fd);
+                tuna->boostpulse_fd = -1;
+                tuna->boostpulse_warned = 0;
+                pthread_mutex_unlock(&tuna->lock);
+            }
+        }
         break;
 
     case POWER_HINT_VSYNC:
@@ -160,6 +205,12 @@ static void tuna_power_hint(struct power_module *module, power_hint_t hint,
     default:
         break;
     }
+}
+
+static void tuna_power_init(struct power_module *module)
+{
+    get_scaling_governor();
+    configure_governor();
 }
 
 static struct hw_module_methods_t power_module_methods = {
@@ -174,10 +225,9 @@ struct tuna_power_module HAL_MODULE_INFO_SYM = {
             hal_api_version: HARDWARE_HAL_API_VERSION,
             id: POWER_HARDWARE_MODULE_ID,
             name: "Tuna Power HAL",
-            author: "The Android Open Source Project",
+            author: "The CyanogenMod Project",
             methods: &power_module_methods,
         },
-
        init: tuna_power_init,
        setInteractive: tuna_power_set_interactive,
        powerHint: tuna_power_hint,
