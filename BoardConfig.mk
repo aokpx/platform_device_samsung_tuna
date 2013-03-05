@@ -30,15 +30,22 @@ TARGET_CPU_ABI2 := armeabi
 TARGET_CPU_SMP := true
 TARGET_ARCH := arm
 TARGET_ARCH_VARIANT := armv7-a-neon
+TARGET_ARCH_VARIANT_CPU := cortex-a9
 ARCH_ARM_HAVE_TLS_REGISTER := true
+ARCH_ARM_HAVE_32_BYTE_CACHE_LINES := true
+TARGET_GLOBAL_CFLAGS += -mtune=cortex-a9 -mfpu=neon -mfloat-abi=softfp
+TARGET_GLOBAL_CPPFLAGS += -mtune=cortex-a9 -mfpu=neon -mfloat-abi=softfp
+
+# Set dlmalloc's alignment to 16-byte
+BOARD_MALLOC_ALIGNMENT := 16
 
 TARGET_NO_BOOTLOADER := true
 
 BOARD_KERNEL_BASE := 0x80000000
 # BOARD_KERNEL_CMDLINE :=
 
-TARGET_KERNEL_SOURCE = kernel/samsung/tuna
-TARGET_KERNEL_CONFIG = tuna_defconfig
+TARGET_KERNEL_SOURCE := kernel/samsung/tuna
+TARGET_KERNEL_CONFIG := tuna_defconfig
 
 TARGET_NO_RADIOIMAGE := true
 TARGET_BOARD_PLATFORM := omap4
